@@ -183,13 +183,29 @@ impl Icon {
         }
     }
 
+    /// Resume's green, Stop's red, Stop All's dark red and Delete's eggplant: their ink while they can be used,
+    /// whatever the theme's icon style.
+    fn signal(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Icon::Resume => Some(GO),
+            Icon::Stop => Some(HALT),
+            Icon::StopAll => Some(HALT_ALL),
+            Icon::Delete => Some(EGGPLANT),
+            _ => None,
+        }
+    }
+
     /// The enabled gradient, top-left → bottom-right (measured from IDM 6.42).
     fn gradient(self) -> (&'static str, &'static str) {
         match self {
             Icon::AddUrl => ("#9ad9b0", "#7fb4c0"),
             // The Torrent pill's purple.
             Icon::AddTorrent => ("#b07ad9", "#7d5fd0"),
-            Icon::Resume | Icon::Stop | Icon::StopAll | Icon::Delete => ("#e2e2e2", "#b4b4b4"),
+            Icon::Delete => EGGPLANT,
+            // Ours: green and red while they can be used, so they stand out from their grey off look.
+            Icon::Resume => GO,
+            Icon::Stop => HALT,
+            Icon::StopAll => HALT_ALL,
             Icon::DeleteCompleted => ("#df6a9c", "#8180c0"),
             Icon::Options => ("#7883c2", "#9b84d0"),
             Icon::Scheduler => ("#a986d2", "#c0957a"),
@@ -257,6 +273,9 @@ impl Icon {
         if !enabled {
             return (to_hex(c.icon_disabled), to_hex(c.icon_disabled_end));
         }
+        if let Some((a, b)) = self.signal() {
+            return (a.to_owned(), b.to_owned());
+        }
         match crate::theme::current().icons {
             IconStyle::Color => {
                 let (a, b) = self.gradient();
@@ -297,6 +316,10 @@ impl Icon {
     /// The icon, enabled or greyed: the theme's own where its icon set has one (a one-colour
     /// icon in the text colour), else the classic outline.
     pub fn image(self, enabled: bool) -> Image<'static> {
+        // Resume, Stop and Stop All keep their colours in every theme while they can be used.
+        if enabled && self.signal().is_some() {
+            return Image::new(self.source(true));
+        }
         let ink = crate::themeicons::ink(enabled);
         if let Some((src, tint)) = self
             .need()
@@ -353,6 +376,15 @@ impl Icon {
         })
     }
 }
+
+/// Resume's ink while it can be used.
+const GO: (&str, &str) = ("#5fd38a", "#239a55");
+/// Stop's ink while it can be used.
+const HALT: (&str, &str) = ("#f27878", "#c93a3a");
+/// Stop All's ink while it can be used: a darker red than Stop's.
+const HALT_ALL: (&str, &str) = ("#b52a2a", "#7a1010");
+/// Delete's ink while it can be used: eggplant, apart from Stop's reds.
+const EGGPLANT: (&str, &str) = ("#8e4f86", "#5a2d55");
 
 /// The download list's mark for a private (incognito) window's download (#1581): Lucide
 /// "venetian-mask", 16 × 16, inked in `ink` (the row's text colour, so it reads on a selected
