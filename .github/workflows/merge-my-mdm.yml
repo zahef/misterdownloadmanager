@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       base: {default: 51c631dc2a8299e0a2035b449a50cedac159fcf2}
-      union: {default: "crates/engine/src/download.rs"}
+      resolve: {default: "{}"}
       branches: {default: "pr/preview-while-downloading pr/main-queue-default auto-remove-deleted toolbar-colors retry-server-down"}
 permissions:
   contents: write
@@ -14,16 +14,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: resolver
+        run: echo "$RES" | base64 -d > "$RUNNER_TEMP/resolve.py"
+        env:
+          RES: IyBSZXNvbHZlIGNvbmZsaWN0IGJsb2NrcyBhcyAib3VycyArIGpvaW5lciArIHRoZWlycyIgKGJvdGggc2lkZXMga2VwdCksIHBlciBmaWxlIHBlciBodW5rLgppbXBvcnQganNvbiwgb3MsIHJlLCBzeXMsIHN1YnByb2Nlc3MKcGxhbiA9IGpzb24ubG9hZHMob3MuZW52aXJvblsnUkVTT0xWRSddKS5nZXQoc3lzLmFyZ3ZbMV0sIHt9KQpsZWZ0ID0gc3VicHJvY2Vzcy5ydW4oWydnaXQnLCdkaWZmJywnLS1uYW1lLW9ubHknLCctLWRpZmYtZmlsdGVyPVUnXSxjYXB0dXJlX291dHB1dD1UcnVlLHRleHQ9VHJ1ZSkuc3Rkb3V0LnNwbGl0KCkKZm9yIGYgaW4gbGVmdDoKICAgIGlmIGYgbm90IGluIHBsYW46IHN5cy5leGl0KGYnbm8gcGxhbiBmb3Ige2Z9JykKICAgIHMgPSBvcGVuKGYsIGVuY29kaW5nPSd1dGYtOCcpLnJlYWQoKQogICAgYmxvY2tzID0gcmUuZmluZGFsbChyJzw8PDw8PDwgW15cbl0qXG4oLio/KT09PT09PT1cbiguKj8pPj4+Pj4+PiBbXlxuXSpcbicsIHMsIHJlLlMpCiAgICBqb2lucyA9IHBsYW5bZl0KICAgIGFzc2VydCBsZW4oYmxvY2tzKSA9PSBsZW4oam9pbnMpLCAoZiwgbGVuKGJsb2NrcyksIGxlbihqb2lucykpCiAgICBpdCA9IGl0ZXIoam9pbnMpCiAgICBzID0gcmUuc3ViKHInPDw8PDw8PCBbXlxuXSpcbiguKj8pPT09PT09PVxuKC4qPyk+Pj4+Pj4+IFteXG5dKlxuJywgbGFtYmRhIG06IG1bMV0gKyBuZXh0KGl0KSArIG1bMl0sIHMsIGZsYWdzPXJlLlMpCiAgICBvcGVuKGYsICd3JywgZW5jb2Rpbmc9J3V0Zi04JywgbmV3bGluZT0nJykud3JpdGUocykKICAgIHN1YnByb2Nlc3MucnVuKFsnZ2l0JywnYWRkJyxmXSxjaGVjaz1UcnVlKQpwcmludCgncmVzb2x2ZWQnLCBsZWZ0KQo=
       - name: merge
         run: |
           git config user.name zahef
           git config user.email 23631005+zahef@users.noreply.github.com
           printf 'CHANGELOG.md merge=union\nROADMAP.md merge=union\ni18n/*.tsv merge=union\n' > .git/info/attributes
-          for f in ${{ inputs.union }}; do echo "$f merge=union" >> .git/info/attributes; done
           git checkout -q ${{ inputs.base }}
           for b in ${{ inputs.branches }}; do
             git fetch -q origin "$b"
-            if git merge --no-edit -m "my-mdm: add $b" FETCH_HEAD; then echo "OK $b"; else
+            if git merge --no-edit -m "my-mdm: add $b" FETCH_HEAD; then echo "OK $b";
+            elif RESOLVE='${{ inputs.resolve }}' python3 "$RUNNER_TEMP/resolve.py" "$b" && git commit --no-edit; then echo "OK (resolved) $b"; else
               echo "CONFLICTS in $b:"; git diff --name-only --diff-filter=U
               for f in $(git diff --name-only --diff-filter=U); do echo "===== $f"; git diff -- "$f" | head -c 30000; done
               exit 1
