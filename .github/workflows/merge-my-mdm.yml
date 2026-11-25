@@ -1,6 +1,9 @@
 name: merge upstream into my-mdm
 on:
   workflow_dispatch:
+    inputs:
+      base: {default: 51c631dc2a8299e0a2035b449a50cedac159fcf2}
+      branches: {default: "pr/preview-while-downloading pr/main-queue-default auto-remove-deleted toolbar-colors retry-server-down"}
 permissions:
   contents: write
 jobs:
@@ -9,18 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: my-mdm
           fetch-depth: 0
       - name: merge
         run: |
           git config user.name zahef
           git config user.email 23631005+zahef@users.noreply.github.com
-          git fetch origin main
-          if git merge --no-edit -m "my-mdm: the developer's latest main" origin/main; then
-            git push origin HEAD:refs/heads/my-mdm-next
-            echo MERGED $(git rev-parse HEAD)
-          else
-            echo "CONFLICTS:"; git diff --name-only --diff-filter=U
-            for f in $(git diff --name-only --diff-filter=U); do echo "===== $f"; git diff -- "$f" | head -c 20000; done
-            exit 1
-          fi
+          printf 'CHANGELOG.md merge=union\nROADMAP.md merge=union\ni18n/*.tsv merge=union\n' > .git/info/attributes
+          git checkout -q ${{ inputs.base }}
+          for b in ${{ inputs.branches }}; do
+            git fetch -q origin "$b"
+            if git merge --no-edit -m "my-mdm: add $b" FETCH_HEAD; then echo "OK $b"; else
+              echo "CONFLICTS in $b:"; git diff --name-only --diff-filter=U
+              for f in $(git diff --name-only --diff-filter=U); do echo "===== $f"; git diff -- "$f" | head -c 30000; done
+              exit 1
+            fi
+          done
+          git push -f origin HEAD:refs/heads/my-mdm-next
+          echo MERGED $(git rev-parse HEAD)
