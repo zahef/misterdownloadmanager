@@ -1516,6 +1516,7 @@ impl Download {
             settle: Default::default(),
             keep: CancellationToken::new(),
             kept: Default::default(),
+            sequential: Default::default(),
         });
         let task = tokio::spawn(f(shared.clone(), cancel.clone()));
         Download {
@@ -1554,6 +1555,15 @@ impl Download {
 
     pub fn speed_limit(&self) -> Option<u64> {
         self.shared.limiter.get()
+    }
+
+    /// Fetch the rest of the file from its start onward (Preview: played while it downloads).
+    /// shortcut: not saved in the resume state, so a resumed download goes back to the usual order.
+    pub fn set_sequential(&self, on: bool) {
+        self.shared.sequential.store(on, Ordering::Relaxed);
+        if let Some(p) = self.shared.planner.lock().unwrap().as_mut() {
+            p.set_sequential(on);
+        }
     }
 
     pub async fn wait(self) -> Result<Outcome, Error> {
@@ -1659,6 +1669,8 @@ struct Shared {
     keep: CancellationToken,
     /// It did: what arrived is the file, short of whatever a checksum was for.
     kept: std::sync::atomic::AtomicBool,
+    /// Fetch from the start onward (Preview), for a planner made after it was asked.
+    sequential: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -2604,6 +2616,7 @@ async fn run_fresh(
     let size = if let Some(size) = size {
         let mut planner = Planner::new(size, opts.min_split);
         planner.set_preempt_after(preempt_after);
+        planner.set_sequential(shared.sequential.load(Ordering::Relaxed));
         *shared.planner.lock().unwrap() = Some(planner);
         let mut saved = ResumeState::new(
             req.url.clone(),
@@ -2852,6 +2865,7 @@ async fn run_fresh_ftp(
     let size = if let Some(size) = size {
         let mut planner = Planner::new(size, opts.min_split);
         planner.set_preempt_after(preempt_after);
+        planner.set_sequential(shared.sequential.load(Ordering::Relaxed));
         *shared.planner.lock().unwrap() = Some(planner);
         // No password on disk: whoever resumes gives the login again.
         let url = crate::ftp::without_password(&req.url);
@@ -3068,6 +3082,7 @@ async fn run_resume(
     let mut planner = Planner::resume(saved.size, opts.min_split, &saved.segments)
         .map_err(|_| bad("segments do not cover the file"))?;
     planner.set_preempt_after(PREEMPT_MIN);
+    planner.set_sequential(shared.sequential.load(Ordering::Relaxed));
     *shared.planner.lock().unwrap() = Some(planner);
     {
         let mut v = shared.view.lock().unwrap();
@@ -3273,12 +3288,7 @@ fn finish(
             .unwrap_or("download");
         naming::unique_path(dir, name)
     };
-    // Antivirus scanners and indexers briefly lock new files on Windows: retry the rename.
-    let rename = |to: &Path| {
-        craft_atomic::retry_rename(craft_atomic::RenameRetry::platform(), || {
-            std::fs::rename(&part, to)
-        })
-    };
+    let rename = |to: &Path| finish_part(&part, to);
     let dest = match final_place(dest, replace) {
         Final::Free => {
             rename(dest)?;
@@ -3327,6 +3337,31 @@ fn finish(
     }
     let _ = std::fs::remove_file(state);
     Ok(Outcome { path: dest, size })
+}
+
+/// `part` renamed to `to`, tried again while an antivirus scanner or an indexer briefly holds it
+/// (Windows). A program that keeps it open and won't let it be renamed (a video player Preview
+/// opened it in, #1682) doesn't fail the finished download: `to` becomes a second name of the
+/// data (a copy where the drive has no hard links: FAT32, exFAT), and `part` goes when it can
+/// (the app removes it once the program lets go).
+fn finish_part(part: &Path, to: &Path) -> io::Result<()> {
+    let renamed = craft_atomic::retry_rename(craft_atomic::RenameRetry::platform(), || {
+        std::fs::rename(part, to)
+    });
+    match renamed {
+        // ERROR_SHARING_VIOLATION
+        Err(e) if cfg!(windows) && e.raw_os_error() == Some(32) && !to.exists() => {
+            if std::fs::hard_link(part, to).is_err()
+                && let Err(c) = std::fs::copy(part, to)
+            {
+                let _ = std::fs::remove_file(to);
+                return Err(c);
+            }
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+        r => r,
+    }
 }
 
 /// Whether a new download to `dest` may replace the file at its place
@@ -6910,6 +6945,32 @@ mod tests {
             );
         }
         assert!(!Error::Throttled(StatusCode::SERVICE_UNAVAILABLE, None).link_dead());
+    }
+
+    /// #1682: a part file a program holds open and won't let be renamed (a video player Preview
+    /// opened it in) still finishes: the file is there under its own name.
+    #[cfg(windows)]
+    #[test]
+    fn a_part_a_player_holds_open_still_finishes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("v.mkv.mdm.part");
+        let to = dir.path().join("v.mkv");
+        std::fs::write(&part, b"video").unwrap();
+        // A player's open: reading, sharing reading and writing but not deleting (the C
+        // runtime's, as VLC opens files).
+        let player = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&part)
+            .unwrap();
+        assert!(
+            std::fs::rename(&part, &to).is_err(),
+            "the player stops a rename"
+        );
+        finish_part(&part, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"video");
+        drop(player);
     }
 
     #[test]
