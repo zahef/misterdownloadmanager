@@ -1,0 +1,26 @@
+name: merge upstream into my-mdm
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: my-mdm
+          fetch-depth: 0
+      - name: merge
+        run: |
+          git config user.name zahef
+          git config user.email 23631005+zahef@users.noreply.github.com
+          git fetch origin main
+          if git merge --no-edit -m "my-mdm: the developer's latest main" origin/main; then
+            git push origin HEAD:refs/heads/my-mdm-next
+            echo MERGED $(git rev-parse HEAD)
+          else
+            echo "CONFLICTS:"; git diff --name-only --diff-filter=U
+            for f in $(git diff --name-only --diff-filter=U); do echo "===== $f"; git diff -- "$f" | head -c 20000; done
+            exit 1
+          fi
