@@ -79,6 +79,9 @@ struct GoneLook {
     waiting: Vec<Pending>,
 }
 
+/// How often finished downloads' files are looked at, to take the deleted ones off the list.
+const GONE_SWEEP_EVERY: Duration = Duration::from_secs(10);
+
 /// How a finished file is looked at for [`GoneLook`] (`model::finished_file_gone`; a test's).
 type GoneCheck = std::sync::Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>;
 
@@ -1515,6 +1518,10 @@ pub struct App {
     deleter: crate::deleter::Deleter,
     /// Finished files looked at beside the window for the duplicate check, the adds waiting.
     gone_looks: Vec<GoneLook>,
+    /// Finished downloads whose file was deleted outside MDM leave the list by themselves: the
+    /// look at their files running beside the window, and when the next one is due.
+    gone_sweep: Option<std::sync::mpsc::Receiver<Vec<(u64, PathBuf)>>>,
+    gone_sweep_at: Instant,
     /// How they are looked at.
     gone_check: GoneCheck,
     /// A look's answer while the adds that waited for it are checked again: (row, place, gone).
@@ -2395,6 +2402,9 @@ impl App {
                 crate::deleter::Deleter::new(move || ctx.request_repaint())
             },
             gone_looks: Vec::new(),
+            gone_sweep: None,
+            // The first look a little after start-up, not while the window is being made.
+            gone_sweep_at: Instant::now() + GONE_SWEEP_EVERY,
             gone_check: std::sync::Arc::new(|dest: &std::path::Path| {
                 model::finished_file_gone(Status::Complete, dest)
             }),
@@ -6508,6 +6518,65 @@ impl App {
         }
     }
 
+    /// A finished download whose file was deleted outside MDM (Explorer, another program) is
+    /// taken off the list, its file being gone: looked at every few seconds, beside the window
+    /// (a share that is off takes long to answer). Not when its folder is gone too (a drive
+    /// unplugged: the file may come back, `model::finished_file_gone`), nor one dragged out to
+    /// a place MDM couldn't learn (#869), nor one seeding.
+    fn sweep_gone_files(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.gone_sweep {
+            match rx.try_recv() {
+                Ok(gone) => {
+                    self.gone_sweep = None;
+                    // Still as looked at: not downloaded again, moved or removed meanwhile.
+                    let ids: Vec<u64> = gone
+                        .into_iter()
+                        .filter(|(id, dest)| {
+                            self.items.iter().any(|i| {
+                                i.id == *id
+                                    && i.dest == *dest
+                                    && i.status == Status::Complete
+                                    && !i.moved_away
+                            })
+                        })
+                        .map(|(id, _)| id)
+                        .collect();
+                    if !ids.is_empty() {
+                        self.remove_downloads(&ids, false);
+                        self.dirty = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gone_sweep = None,
+            }
+        }
+        let now = Instant::now();
+        if now < self.gone_sweep_at {
+            return;
+        }
+        self.gone_sweep_at = now + GONE_SWEEP_EVERY;
+        ctx.request_repaint_after(GONE_SWEEP_EVERY);
+        let files: Vec<(u64, PathBuf)> = self
+            .items
+            .iter()
+            .filter(|i| i.status == Status::Complete && !i.moved_away && i.live.is_none())
+            .map(|i| (i.id, i.dest.clone()))
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (check, ctx) = (self.gone_check.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let gone: Vec<(u64, PathBuf)> = files.into_iter().filter(|(_, d)| check(d)).collect();
+            if !gone.is_empty() {
+                let _ = tx.send(gone);
+                ctx.request_repaint();
+            }
+        });
+        self.gone_sweep = Some(rx);
+    }
+
     fn poll_deferred_torrent_renames(&mut self) {
         if !self.deferred_torrent_queue.is_empty() {
             let queued = std::mem::take(&mut self.deferred_torrent_queue);
@@ -9687,6 +9756,7 @@ impl App {
         self.poll_dragged_out();
         self.poll_deferred_torrent_renames();
         self.poll_previews();
+        self.sweep_gone_files(ctx);
         if !self.moving.is_empty()
             || !self.moving_parts.is_empty()
             || !self.renaming.is_empty()
@@ -18141,6 +18211,30 @@ mod start_disk_tests {
             );
             app.stop(id);
         }
+    }
+
+    /// A finished download whose file was deleted outside MDM leaves the list by itself; one
+    /// whose file is there, or whose whole folder is gone (a drive unplugged), stays.
+    #[test]
+    fn a_finished_download_whose_file_was_deleted_leaves_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("kept.bin");
+        std::fs::write(&kept, b"still here").unwrap();
+        let deleted = dir.path().join("deleted.bin");
+        let unplugged = dir.path().join("drive").join("away.bin");
+        let mut app = app_with(vec![
+            row(1, kept, Status::Complete),
+            row(2, deleted, Status::Complete),
+            row(3, unplugged, Status::Complete),
+        ]);
+        app.gone_sweep_at = Instant::now();
+        until(
+            &mut app,
+            |app| app.sweep_gone_files(&egui::Context::default()),
+            |app| app.items.len() < 3,
+        );
+        let left: Vec<u64> = app.items.iter().map(|i| i.id).collect();
+        assert_eq!(left, [1, 3]);
     }
 
     /// Adding an address already in the list as a finished download doesn't look at its file on
