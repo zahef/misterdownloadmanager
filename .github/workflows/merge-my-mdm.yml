@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       base: {default: 51c631dc2a8299e0a2035b449a50cedac159fcf2}
+      union: {default: "crates/engine/src/download.rs"}
       branches: {default: "pr/preview-while-downloading pr/main-queue-default auto-remove-deleted toolbar-colors retry-server-down"}
 permissions:
   contents: write
@@ -18,6 +19,7 @@ jobs:
           git config user.name zahef
           git config user.email 23631005+zahef@users.noreply.github.com
           printf 'CHANGELOG.md merge=union\nROADMAP.md merge=union\ni18n/*.tsv merge=union\n' > .git/info/attributes
+          for f in ${{ inputs.union }}; do echo "$f merge=union" >> .git/info/attributes; done
           git checkout -q ${{ inputs.base }}
           for b in ${{ inputs.branches }}; do
             git fetch -q origin "$b"
