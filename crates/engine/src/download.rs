@@ -544,17 +544,29 @@ impl Error {
     }
 
     /// A failure of the first request that a later try may not have: a busy server (429, 503),
-    /// a server error (500, 502, 504), a network that failed to connect or went quiet.
+    /// a server that is down for now (`server_down`), a network that failed to connect or went
+    /// quiet.
     fn transient(&self) -> bool {
         match self {
             Error::Throttled(..) => true,
-            Error::Status(s) => matches!(s.as_u16(), 500 | 502 | 504),
+            Error::Status(_) => self.server_down(),
             Error::Http(h) => h.is_connect() || h.is_timeout() || h.is_request() || h.is_body(),
             Error::ShortBody => true,
             // Too many sessions; no data connection; transfer aborted; file busy; local error.
             Error::FtpReply { code, .. } => matches!(code, 421 | 425 | 426 | 450 | 451),
             Error::Net { kind, .. } => *kind != NetKind::Tls,
             Error::Refused(Refusal::Service { fault, .. }) => fault.retry_wait().is_some(),
+            _ => false,
+        }
+    }
+
+    /// The server, or the CDN in front of it, is down or busy for now: a server error (500, 502,
+    /// 504), Cloudflare's 520-524 and 530 (its server didn't answer), a busy server (429, 503).
+    /// Waited out for `DOWN_PATIENCE`, not just `max_retries` quick tries.
+    fn server_down(&self) -> bool {
+        match self {
+            Error::Throttled(..) => true,
+            Error::Status(s) => matches!(s.as_u16(), 500 | 502 | 504 | 520..=524 | 530),
             _ => false,
         }
     }
@@ -571,6 +583,22 @@ impl Error {
             _ => false,
         }
     }
+}
+
+/// How long a server that is down (`Error::server_down`) is tried again before the download
+/// fails: a site behind Cloudflare is often back within minutes.
+const DOWN_PATIENCE: Duration = Duration::from_secs(600);
+
+/// Whether try number `failures + 1` is made after `e`, the failures having started at `since`:
+/// `max_retries` of them, or for `DOWN_PATIENCE` while the server is down.
+fn keep_trying(
+    opts: &Options,
+    failures: u32,
+    e: &Error,
+    since: Option<std::time::Instant>,
+) -> bool {
+    failures <= opts.max_retries
+        || e.server_down() && since.is_none_or(|t| t.elapsed() < DOWN_PATIENCE)
 }
 
 /// How long to wait before try number `failures + 1` after `e`: the first retry at once (IDM
@@ -4606,12 +4634,14 @@ where
     Fut: Future<Output = Result<T, Error>>,
 {
     let mut failures = 0;
+    let mut since = None;
     loop {
         let asked = std::time::Instant::now();
         match cancellable(cancel, attempt()).await {
             Ok(got) => return Ok((got, asked.elapsed())),
-            Err(e) if e.transient() && failures < opts.max_retries => {
+            Err(e) if e.transient() && keep_trying(opts, failures + 1, &e, since) => {
                 failures += 1;
+                since.get_or_insert_with(std::time::Instant::now);
                 shared.event(format!("Connection 1: {e}; retrying"));
                 shared.conn(0, |c| c.status = ConnStatus::Retrying(e.clone()));
                 if let Some(delay) = retry_wait(opts, failures, &e) {
@@ -4742,6 +4772,7 @@ async fn worker(ctx: Arc<Ctx>, id: WorkerId, mut first: Option<Body>) -> Result<
     let mut failures = 0u32;
     // Bytes this connection had received at its last failure: progress since resets the budget.
     let mut at_last_failure = 0u64;
+    let mut since = None;
     loop {
         if ctx.cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -4880,10 +4911,12 @@ async fn worker(ctx: Arc<Ctx>, id: WorkerId, mut first: Option<Body>) -> Result<
                 ctx.shared.conn(id, |c| received = c.downloaded);
                 if received > at_last_failure {
                     failures = 0;
+                    since = None;
                 }
                 at_last_failure = received;
                 failures += 1;
-                if failures > ctx.opts.max_retries {
+                since.get_or_insert_with(std::time::Instant::now);
+                if !keep_trying(&ctx.opts, failures, &e, since) {
                     let others = ctx.shared.with_planner(|p| p.active_workers()) > 0;
                     ctx.shared
                         .conn(id, |c| c.status = ConnStatus::Failed(e.clone()));
@@ -6971,6 +7004,23 @@ mod tests {
         finish_part(&part, &to).unwrap();
         assert_eq!(std::fs::read(&to).unwrap(), b"video");
         drop(player);
+    }
+
+    #[test]
+    fn a_server_that_is_down_is_waited_out() {
+        let o = Options::default();
+        let many = o.max_retries + 3;
+        let now = std::time::Instant::now();
+        let down = Error::Status(StatusCode::from_u16(523).unwrap());
+        assert!(down.transient());
+        assert!(keep_trying(&o, many, &down, Some(now)));
+        if let Some(long_ago) = now.checked_sub(DOWN_PATIENCE) {
+            assert!(!keep_trying(&o, many, &down, Some(long_ago)));
+        }
+        // Not down: the usual few tries.
+        let other = Error::Status(StatusCode::from_u16(501).unwrap());
+        assert!(keep_trying(&o, o.max_retries, &other, Some(now)));
+        assert!(!keep_trying(&o, o.max_retries + 1, &other, Some(now)));
     }
 
     #[test]

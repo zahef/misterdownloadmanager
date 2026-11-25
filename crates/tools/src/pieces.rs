@@ -424,11 +424,18 @@ enum PieceError {
     Again(String),
     /// 429 or 503: the server wants fewer requests (for this long, when it says).
     Busy(String, Option<Duration>),
+    /// The server, or the CDN in front of it, is down for now (500, 502, 504, Cloudflare's
+    /// 520-524 and 530): tried again for `DOWN_PATIENCE`, then as `Again`.
+    Down(String),
     /// The site's bot check refused it on the browser-like connection too (#1289): neither a
     /// new list nor another try gets past it.
     Refused(String),
     Stopped,
 }
+
+/// How long a piece whose server is down (`PieceError::Down`) is tried again before the stream
+/// fails: a site behind Cloudflare is often back within minutes.
+const DOWN_PATIENCE: Duration = Duration::from_secs(600);
 
 /// What every connection shares.
 struct Run {
@@ -594,6 +601,7 @@ pub async fn download(
         Some(
             PieceError::Dead(e)
             | PieceError::Again(e)
+            | PieceError::Down(e)
             | PieceError::Busy(e, _)
             | PieceError::Refused(e),
         ) => {
@@ -651,6 +659,7 @@ async fn connection(run: Arc<Run>, c: usize) -> Result<(), PieceError> {
             continue;
         }
         let mut failures = 0u32;
+        let mut down_since = None;
         loop {
             if run.cancel.is_cancelled() {
                 return Err(PieceError::Stopped);
@@ -658,8 +667,29 @@ async fn connection(run: Arc<Run>, c: usize) -> Result<(), PieceError> {
             let generation = run.generation.load(Ordering::SeqCst);
             let piece = run.pieces.lock().unwrap()[i].clone();
             set_conn(&run, c, |v| v.status = ConnStatus::Connecting);
-            match fetch_piece(&run, c, i, &piece).await {
+            let got = fetch_piece(&run, c, i, &piece).await;
+            if matches!(got, Err(PieceError::Down(_))) {
+                down_since.get_or_insert_with(Instant::now);
+            }
+            match got {
                 Ok(()) => break,
+                // The server is down for now: wait it out (up to 30 s between tries).
+                Err(PieceError::Down(e))
+                    if down_since.is_some_and(|t: Instant| t.elapsed() < DOWN_PATIENCE) =>
+                {
+                    failures += 1;
+                    let wait = (run.retry_delay * 2u32.saturating_pow(failures - 1))
+                        .min(Duration::from_secs(30));
+                    run.shared.note(format!(
+                        "Connection {}: {e}; the server is down, again in {} s",
+                        c + 1,
+                        wait.as_secs().max(1)
+                    ));
+                    tokio::select! {
+                        _ = run.cancel.cancelled() => return Err(PieceError::Stopped),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
                 Err(PieceError::Stopped) => return Err(PieceError::Stopped),
                 // A gallery's file that can't be had is left for gallery-dl.
                 Err(PieceError::Dead(e) | PieceError::Refused(e)) if run.files.is_some() => {
@@ -713,7 +743,9 @@ async fn connection(run: Arc<Run>, c: usize) -> Result<(), PieceError> {
                         _ = tokio::time::sleep(wait) => {}
                     }
                 }
-                Err(PieceError::Again(e)) if run.files.is_some() && failures >= run.max_retries => {
+                Err(PieceError::Again(e) | PieceError::Down(e))
+                    if run.files.is_some() && failures >= run.max_retries =>
+                {
                     run.shared
                         .note(format!("File {}: {e}; left for gallery-dl", i + 1));
                     break;
@@ -727,7 +759,7 @@ async fn connection(run: Arc<Run>, c: usize) -> Result<(), PieceError> {
                         return Err(PieceError::Dead(e));
                     }
                 }
-                Err(PieceError::Again(e)) => {
+                Err(PieceError::Again(e) | PieceError::Down(e)) => {
                     failures += 1;
                     if failures > run.max_retries {
                         return Err(PieceError::Again(format!("piece {}: {e}", i + 1)));
@@ -839,6 +871,7 @@ fn dead_or_again(status: u16, what: &str, retry_after: Option<Duration>) -> Piec
     match status {
         401 | 403 | 404 | 410 => PieceError::Dead(e),
         429 | 503 => PieceError::Busy(e, retry_after),
+        500 | 502 | 504 | 520..=524 | 530 => PieceError::Down(e),
         _ => PieceError::Again(e),
     }
 }
@@ -1079,6 +1112,28 @@ mod tests {
 
     fn base() -> Url {
         Url::parse("https://cdn.example/v/720p/index.m3u8?sig=1").unwrap()
+    }
+
+    #[test]
+    fn a_server_that_is_down_is_waited_out() {
+        for s in [500, 502, 504, 520, 523, 524, 530] {
+            assert!(
+                matches!(dead_or_again(s, "the piece", None), PieceError::Down(_)),
+                "{s}"
+            );
+        }
+        assert!(matches!(
+            dead_or_again(404, "the piece", None),
+            PieceError::Dead(_)
+        ));
+        assert!(matches!(
+            dead_or_again(503, "the piece", None),
+            PieceError::Busy(..)
+        ));
+        assert!(matches!(
+            dead_or_again(501, "the piece", None),
+            PieceError::Again(_)
+        ));
     }
 
     #[test]
