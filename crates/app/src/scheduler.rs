@@ -165,6 +165,8 @@ pub struct Scheduler {
     /// The files picked with Ctrl / Shift (their ids), and the row a Shift-click counts from.
     files_marked: std::collections::HashSet<u64>,
     files_anchor: Option<usize>,
+    /// A file dragged up or down the list: the row it was pressed on, and whether it moved yet.
+    files_drag: Option<(usize, bool)>,
     /// Each queue's downloads as the app last had them ([`Scheduler::sync_items`]).
     base: std::collections::HashMap<String, Vec<u64>>,
     focus: Focus,
@@ -237,6 +239,7 @@ impl Scheduler {
             files_rows: Default::default(),
             files_marked: Default::default(),
             files_anchor: None,
+            files_drag: None,
             focus: Focus::default(),
             naming: None,
             deleting: None,
@@ -1260,6 +1263,7 @@ impl Scheduler {
                 crate::i18n::mark("Remove from the queue"),
             ),
         ];
+        let mut moved_by_button = false;
         for (icon, x, enabled, tip) in buttons {
             let rc = r(o, x, 387.0 + DY, 19.0, 21.0);
             let clicked = winui::icon_button_light(ui, rc, icon, enabled, tip).clicked()
@@ -1284,6 +1288,7 @@ impl Scheduler {
             if !(clicked && enabled) {
                 continue;
             }
+            moved_by_button = true;
             let q = &mut self.queues[self.selected];
             // Positions in `rows` map to the queue's ids in order (missing items are skipped).
             let pos: Vec<usize> = rows
@@ -1312,6 +1317,87 @@ impl Scheduler {
                 }
             }
         }
+        if !moved_by_button {
+            self.drag_files(ui, &p, body, &rows);
+        }
+    }
+
+    /// Dragging a file up or down the list moves it there (the picked files, when it is one of
+    /// them), a line showing where it lands.
+    fn drag_files(&mut self, ui: &Ui, p: &egui::Painter, body: Rect, rows: &[&Item]) {
+        const ROW: f32 = 17.0;
+        let n = rows.len();
+        let first = self.files_rows.first;
+        let page = (((body.height() - 2.0) / ROW).floor() as usize).max(1);
+        let (pressed, down, origin, at) = ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.press_origin(),
+                i.pointer.interact_pos(),
+            )
+        });
+        let slot = |y: f32| ((y - body.top() - 1.0) / ROW) + first as f32;
+        if pressed {
+            // On a row, not on the scroll bar.
+            let bar = if n > page {
+                crate::scrollbar::THICK
+            } else {
+                0.0
+            };
+            let rows_area = Rect::from_min_max(body.min, pos2(body.right() - bar, body.bottom()));
+            self.files_drag = origin
+                .filter(|o| winui::rect(rows_area).contains(*o))
+                .map(|o| slot(o.y).floor() as usize)
+                .filter(|k| *k < n)
+                .map(|k| (k, false));
+            return;
+        }
+        let (Some((from, moved)), Some(at), Some(origin)) = (self.files_drag, at, origin) else {
+            return;
+        };
+        let moved = moved || (at.y - origin.y).abs() > 4.0;
+        // Where it lands: before this row (n: at the end), within the rows in view.
+        // shortcut: no scrolling while dragging, past the view; drop at its edge and drag again.
+        let to = (slot(at.y).round().max(first as f32) as usize).min(n.min(first + page));
+        if down {
+            self.files_drag = Some((from, moved));
+            if moved {
+                let y = body.top() + 1.0 + ROW * to.saturating_sub(first) as f32;
+                fill(
+                    p,
+                    body.left() + 1.0,
+                    y - 1.0,
+                    body.right() - 1.0,
+                    y + 1.0,
+                    winui::TEXT(),
+                );
+                ui.ctx().request_repaint();
+            }
+            return;
+        }
+        self.files_drag = None;
+        if !moved || from >= n {
+            return;
+        }
+        let dragged = rows[from].id;
+        if !self.files_marked.contains(&dragged) {
+            self.files_marked = [dragged].into();
+        }
+        let q = &mut self.queues[self.selected];
+        let before = rows
+            .get(to)
+            .and_then(|r| q.items.iter().position(|x| *x == r.id))
+            .unwrap_or(q.items.len());
+        q.items = drop_moving(&q.items, &self.files_marked, before);
+        // The focused row and the Shift anchor follow the dragged file.
+        let row = q
+            .items
+            .iter()
+            .filter(|x| rows.iter().any(|r| r.id == **x))
+            .position(|x| *x == dragged);
+        self.files_rows.selected = row;
+        self.files_anchor = row;
     }
 
     fn limits_page(&mut self, ui: &mut Ui, o: Pos2) {
@@ -2298,6 +2384,27 @@ fn move_marked(marks: &[bool], up: bool) -> Vec<usize> {
     order
 }
 
+/// `items` with the `moving` ones taken out and put back, in their order, before the one at
+/// `before` (`items.len()`: at the end).
+fn drop_moving(items: &[u64], moving: &std::collections::HashSet<u64>, before: usize) -> Vec<u64> {
+    let at = items[..before.min(items.len())]
+        .iter()
+        .filter(|i| !moving.contains(i))
+        .count();
+    let mut out: Vec<u64> = items
+        .iter()
+        .copied()
+        .filter(|i| !moving.contains(i))
+        .collect();
+    let block: Vec<u64> = items
+        .iter()
+        .copied()
+        .filter(|i| moving.contains(i))
+        .collect();
+    out.splice(at..at, block);
+    out
+}
+
 fn merge_items(base: &[u64], draft: &[u64], live: &[u64]) -> Vec<u64> {
     let mut out: Vec<u64> = draft
         .iter()
@@ -2315,6 +2422,23 @@ fn merge_items(base: &[u64], draft: &[u64], live: &[u64]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dragged_files_land_where_dropped() {
+        let set = |v: &[u64]| {
+            v.iter()
+                .copied()
+                .collect::<std::collections::HashSet<u64>>()
+        };
+        let items = [1, 2, 3, 4, 5];
+        // One file down, before the 5th; one up, to the top; to the end.
+        assert_eq!(drop_moving(&items, &set(&[2]), 4), [1, 3, 4, 2, 5]);
+        assert_eq!(drop_moving(&items, &set(&[4]), 0), [4, 1, 2, 3, 5]);
+        assert_eq!(drop_moving(&items, &set(&[1]), 5), [2, 3, 4, 5, 1]);
+        // Picked files move together, in their order, even dropped among themselves.
+        assert_eq!(drop_moving(&items, &set(&[1, 3]), 4), [2, 4, 1, 3, 5]);
+        assert_eq!(drop_moving(&items, &set(&[2, 4]), 3), [1, 3, 2, 4, 5]);
+    }
 
     #[test]
     fn marked_rows_move_together_and_stop_at_the_ends() {
