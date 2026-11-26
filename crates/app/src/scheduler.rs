@@ -165,8 +165,9 @@ pub struct Scheduler {
     /// The files picked with Ctrl / Shift (their ids), and the row a Shift-click counts from.
     files_marked: std::collections::HashSet<u64>,
     files_anchor: Option<usize>,
-    /// A file dragged up or down the list: the row it was pressed on, and whether it moved yet.
-    files_drag: Option<(usize, bool)>,
+    /// A file dragged up or down the list: the row it was pressed on, where the press was
+    /// (egui forgets that as the button comes up) and whether it moved yet.
+    files_drag: Option<(usize, f32, bool)>,
     /// Each queue's downloads as the app last had them ([`Scheduler::sync_items`]).
     base: std::collections::HashMap<String, Vec<u64>>,
     focus: Focus,
@@ -1329,7 +1330,7 @@ impl Scheduler {
         let n = rows.len();
         let first = self.files_rows.first;
         let page = (((body.height() - 2.0) / ROW).floor() as usize).max(1);
-        let (pressed, down, origin, at) = ui.input(|i| {
+        let (pressed, down, press, at) = ui.input(|i| {
             (
                 i.pointer.primary_pressed(),
                 i.pointer.primary_down(),
@@ -1346,22 +1347,29 @@ impl Scheduler {
                 0.0
             };
             let rows_area = Rect::from_min_max(body.min, pos2(body.right() - bar, body.bottom()));
-            self.files_drag = origin
+            self.files_drag = press
                 .filter(|o| winui::rect(rows_area).contains(*o))
-                .map(|o| slot(o.y).floor() as usize)
-                .filter(|k| *k < n)
-                .map(|k| (k, false));
+                .map(|o| (slot(o.y).floor() as usize, o.y))
+                .filter(|(k, _)| *k < n)
+                .map(|(k, y)| (k, y, false));
             return;
         }
-        let (Some((from, moved)), Some(at), Some(origin)) = (self.files_drag, at, origin) else {
+        let Some((from, origin_y, moved)) = self.files_drag else {
             return;
         };
-        let moved = moved || (at.y - origin.y).abs() > 4.0;
+        let Some(at) = at else {
+            // The pointer left the window: dropped nowhere.
+            if !down {
+                self.files_drag = None;
+            }
+            return;
+        };
+        let moved = moved || (at.y - origin_y).abs() > 4.0;
         // Where it lands: before this row (n: at the end), within the rows in view.
         // shortcut: no scrolling while dragging, past the view; drop at its edge and drag again.
         let to = (slot(at.y).round().max(first as f32) as usize).min(n.min(first + page));
         if down {
-            self.files_drag = Some((from, moved));
+            self.files_drag = Some((from, origin_y, moved));
             if moved {
                 let y = body.top() + 1.0 + ROW * to.saturating_sub(first) as f32;
                 fill(
