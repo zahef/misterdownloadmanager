@@ -12,7 +12,7 @@ How Mister Download Manager's pieces fit together.
 | `crates/mcp` | `mdm-mcp` | The MCP server (`misterdownloadmanager-mcp`): AI assistants list, add and control the running app's downloads through the automation API |
 | `crates/remote` | `mdm-remote` | The remote control (#141): the HTTPS server a paired phone or computer on the local network uses (its page, pairing codes, device tokens, the self-signed certificate); every request becomes an automation API command the app answers |
 | `crates/nmhost` | `mdm-nmhost` | The browser's native messaging host: takes captured downloads from the extension and hands them to the app |
-| `crates/ipc` | `mdm-ipc` | The single-instance channel (a token-protected local socket), the data folder, and the capture rules shared by the app and the host |
+| `crates/ipc` | `mdm-ipc` | The single-instance channel (a token-protected local socket), the data folder, the capture rules shared by the app and the host, and the site rules (#1778: a User-Agent, headers, connections and the browser-like connection by site pattern) shared by the app and the command line |
 | `crates/debrid` | `mdm-debrid` | Debrid accounts (#44): the services' official APIs (Real-Debrid, AllDebrid, Premiumize, TorBox, Mega-Debrid) turn a file host's link into a direct one the engine downloads |
 | `crates/cnl` | `mdm-cnl` | Click'n'Load 2 (#37): the listener on 127.0.0.1:9666 that reads a link site's posts into packages for Link grabber, with limits on what it takes |
 | `crates/extract` | `mdm-extract` | Archive extraction (#37): zip, tar, gz and xz in process; 7z and RAR through an installed 7-Zip, run as its own program; in place through HatchZip when asked. Archive tests (`check.rs`, #1661): `7z t`, a ZIP in process without it, and a ZIP's damaged entries placed in the file |
@@ -92,6 +92,19 @@ followed. The depth asked (at most `MAX_DEPTH`), `MAX_FOLDERS`, `MAX_FILES` and 
 size bound it. The app makes each folder's files a package whose folder is the tree's under the
 download folder (`grabber.rs`); the lab server serves made-up trees, a hostile one and a huge one
 (`labserver/src/tree.rs`) over HTTP and FTP for the end-to-end tests.
+
+A Hugging Face model or dataset (or a folder of one, at a revision) and a GitHub release or tag
+given to Link grabber (#1772, `hub.rs`) are listed through the sites' public APIs: the revision is
+first made its commit, then the tree is read page by page (`Link: rel="next"`, the same API's
+only), each entry's path taken only when it is a relative path of plain names inside the folder
+asked (`hub::relative_path`: no `..`, absolute path, drive or device name), matched by its names;
+a file's address is built from the repository, the commit and those names, never taken from the
+answer. Each file keeps its size and the SHA-256 the site publishes (an LFS file's, a release
+asset's `digest`), which becomes the download's checksum. The app makes one package whose folder
+is the address's path under the download folder, each file in its own folders inside it
+(`Imported::within`), unticked; Sites Logins' password for `huggingface.co` goes as an access
+token (`Authorization: Bearer`) to Hugging Face's own hosts only. The lab server plays both APIs
+(`labserver/src/hub.rs`): pages, a gated repository, hostile paths, a wrong digest and rate limits.
 
 Files inside a ZIP on a server (#1775, `remotezip.rs`) are read from its table of contents, at
 its end: Download File Info's one look (`look`: the last `TAIL` bytes, which tell whether the
@@ -174,10 +187,15 @@ every system (`crates/app/src/renderer.rs`): when the chosen one can't start, th
 tried, so the windows always open. A watched start with the system's API leaves a marker until
 its first frame is drawn: a start that ends before it (a crash inside the driver), one whose
 first frame doesn't come within 10 seconds (MDM then starts again with OpenGL), or a graphics
-card lost twice in 10 minutes is remembered with its reason, which the menu shows. With OpenGL,
+card lost twice in 10 minutes is remembered with its reason, which the menu shows. A way that
+can't start within 10 minutes of a lost card isn't remembered: its driver may still be resetting
+(#1974: Direct3D 12 then finds only WARP), so the next start tries it again. With OpenGL,
 a window eframe can't paint (its context can't be made current on it, its frame can't be shown)
 is skipped and painted again 100 ms later; one whose paints keep failing for seconds is a lost
 device too (MDM starts again; twice in 10 minutes, OpenGL is remembered as failing on Windows).
+On Windows, a freeze or a crash whose report shows the window's or the crashed thread inside
+OpenGL's driver is remembered too, by the crash report's window (`crashui.rs`), from the stack's
+modules (#847, #1659).
 The fork's eframe tells MDM through its viewport hooks (`gl_paint_failed`, #1448).
 
 View → Interface size (`scale.rs`, #262) is egui's zoom factor over the display's own scale:

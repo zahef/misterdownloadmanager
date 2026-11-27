@@ -230,6 +230,11 @@ pub struct Options {
     /// removing its file: an archive test that finds damage downloads those parts again from it,
     /// under the same validators (#1661, [`crate::repair`]). The state file still goes.
     pub keep_state: bool,
+    /// A site rule says so (#1778): the first request goes the way a browser connects (#668,
+    /// `crate::browserlike`) at once, not only once the site has refused MDM's own connection.
+    /// When that fails (a build without it, a site that refuses it too), MDM's own connection is
+    /// asked as usual. Never for a form's POST or through a service account.
+    pub browser_first: bool,
 }
 
 /// A callback given the path of a file the engine created (`Options::on_file_created`).
@@ -316,6 +321,7 @@ impl Default for Options {
             request_cap: None,
             slow_disk: None,
             keep_state: false,
+            browser_first: false,
         }
     }
 }
@@ -1074,98 +1080,113 @@ pub async fn probe_kept(
     );
     // Where the look asked, and with what: asked again there if the site refuses (#668).
     let (asked_at, asked_with) = (target.clone(), headers.clone());
-    let (asked, by) = noting_refuser(get(
-        &client,
-        target.clone(),
-        headers.clone(),
-        opts.post.as_ref(),
-        first_opts.site_agent(),
-        expects,
-        &CancellationToken::new(),
-    ))
-    .await;
-    // #1660: a 403 that may be this IP family's is asked once over the other one, as the
-    // download's first request is (`FirstAsk::at`).
-    let look = Look {
-        url: &target,
-        headers: &headers,
-        as_get: &as_get,
-        seen: &seen,
-        expects,
+    // #1778: a site rule asks the way a browser connects from the first request.
+    let early = match unlocked.is_none() {
+        true => {
+            let cancel = CancellationToken::new();
+            browser_at_once(opts, &target, &headers, expects, |_| {}, &cancel).await?
+        }
+        false => None,
     };
     let mut family = None;
-    let (client, asked) = look
-        .over_other_family(first_opts, client, asked, by, &mut family)
-        .await?;
-    // A browser's User-Agent refused (#372): asked once more as MDM, and over the other family
-    // too when it is refused so again (a site that refuses both at once).
-    let (client, asked) = match asked {
-        Err(e) if agent_refused(&e) && first_opts.agent_fallback.is_some() => {
-            let mut plain = opts.clone();
-            plain.user_agent = opts.agent_fallback.clone().unwrap_or_default();
-            let client = self::client(&plain, &target, &as_get, &seen)?;
-            let (asked, by) = noting_refuser(get(
-                &client,
-                target.clone(),
-                headers.clone(),
-                opts.post.as_ref(),
-                plain.site_agent(),
-                expects,
-                &CancellationToken::new(),
-            ))
-            .await;
-            let _ = e;
-            look.over_other_family(&plain, client, asked, by, &mut family)
-                .await?
-        }
-        asked => (client, asked),
-    };
     let (mut client, mut own_agent) = (client, remembered);
-    let (head, body, browser, headers, took) = match asked {
-        Ok((resp, headers, took)) => (Head::of(&resp), Body::Http(resp), None, headers, took),
-        // #668: the site refused MDM's connection as a program's (`refused_as_a_program`):
-        // looked at once more the way a browser connects, its answer kept for the download
-        // (which then asks no more).
-        Err(e) if refused_as_a_program(&e) && unlocked.is_none() && opts.post.is_none() => {
-            if own_agent.take().is_some() {
-                // Remembered, but no longer let through: learnt again next time.
-                crate::agent::forget_own(&asked_at);
+    let (head, body, browser, headers, took) = if let Some((b, answer, switch)) = early {
+        family = switch;
+        let (head, body, headers, took) = answer;
+        (head, body, Some(b), headers, took)
+    } else {
+        let (asked, by) = noting_refuser(get(
+            &client,
+            target.clone(),
+            headers.clone(),
+            opts.post.as_ref(),
+            first_opts.site_agent(),
+            expects,
+            &CancellationToken::new(),
+        ))
+        .await;
+        // #1660: a 403 that may be this IP family's is asked once over the other one, as the
+        // download's first request is (`FirstAsk::at`).
+        let look = Look {
+            url: &target,
+            headers: &headers,
+            as_get: &as_get,
+            seen: &seen,
+            expects,
+        };
+        let (looked, asked) = look
+            .over_other_family(first_opts, client.clone(), asked, by, &mut family)
+            .await?;
+        // A browser's User-Agent refused (#372): asked once more as MDM, and over the other family
+        // too when it is refused so again (a site that refuses both at once).
+        let (got, asked) = match asked {
+            Err(e) if agent_refused(&e) && first_opts.agent_fallback.is_some() => {
+                let mut plain = opts.clone();
+                plain.user_agent = opts.agent_fallback.clone().unwrap_or_default();
+                let client = self::client(&plain, &target, &as_get, &seen)?;
+                let (asked, by) = noting_refuser(get(
+                    &client,
+                    target.clone(),
+                    headers.clone(),
+                    opts.post.as_ref(),
+                    plain.site_agent(),
+                    expects,
+                    &CancellationToken::new(),
+                ))
+                .await;
+                let _ = e;
+                look.over_other_family(&plain, client, asked, by, &mut family)
+                    .await?
             }
-            let cancel = CancellationToken::new();
-            match browser_ask(opts, &asked_at, &asked_with, expects, &cancel).await {
-                Ok((b, (head, body, headers, took), switch)) => {
-                    family = switch;
-                    (head, body, Some(b), headers, took)
+            asked => (looked, asked),
+        };
+        client = got;
+        match asked {
+            Ok((resp, headers, took)) => (Head::of(&resp), Body::Http(resp), None, headers, took),
+            // #668: the site refused MDM's connection as a program's (`refused_as_a_program`):
+            // looked at once more the way a browser connects, its answer kept for the download
+            // (which then asks no more).
+            Err(e) if refused_as_a_program(&e) && unlocked.is_none() && opts.post.is_none() => {
+                if own_agent.take().is_some() {
+                    // Remembered, but no longer let through: learnt again next time.
+                    crate::agent::forget_own(&asked_at);
                 }
-                Err(other @ (Error::Cancelled | Error::Adapter(_))) => return Err(other),
-                // #1422: refused that way too; once more under MDM's own name, the last try.
-                Err(_) => match own.filter(|_| as_own.is_none()) {
-                    Some(own) => {
-                        let o = speaking_own(opts, own.clone());
-                        client = self::client(&o, &asked_at, &as_get, &seen)?;
-                        let (resp, headers, took) = get(
-                            &client,
-                            asked_at.clone(),
-                            asked_with,
-                            None,
-                            o.site_agent(),
-                            expects,
-                            &cancel,
-                        )
-                        .await
-                        .map_err(|other| match other {
-                            Error::Cancelled | Error::Adapter(_) => other,
-                            _ => e,
-                        })?;
-                        crate::agent::remember_own(&asked_at);
-                        own_agent = Some(own);
-                        (Head::of(&resp), Body::Http(resp), None, headers, took)
+                let cancel = CancellationToken::new();
+                match browser_ask(opts, &asked_at, &asked_with, expects, &cancel).await {
+                    Ok((b, (head, body, headers, took), switch)) => {
+                        family = switch;
+                        (head, body, Some(b), headers, took)
                     }
-                    None => return Err(e),
-                },
+                    Err(other @ (Error::Cancelled | Error::Adapter(_))) => return Err(other),
+                    // #1422: refused that way too; once more under MDM's own name, the last try.
+                    Err(_) => match own.filter(|_| as_own.is_none()) {
+                        Some(own) => {
+                            let o = speaking_own(opts, own.clone());
+                            client = self::client(&o, &asked_at, &as_get, &seen)?;
+                            let (resp, headers, took) = get(
+                                &client,
+                                asked_at.clone(),
+                                asked_with,
+                                None,
+                                o.site_agent(),
+                                expects,
+                                &cancel,
+                            )
+                            .await
+                            .map_err(|other| match other {
+                                Error::Cancelled | Error::Adapter(_) => other,
+                                _ => e,
+                            })?;
+                            crate::agent::remember_own(&asked_at);
+                            own_agent = Some(own);
+                            (Head::of(&resp), Body::Http(resp), None, headers, took)
+                        }
+                        None => return Err(e),
+                    },
+                }
             }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     };
     // Whichever connection it came through, the browser-like one too (#954).
     seen.answered(&head);
@@ -2397,7 +2418,7 @@ async fn run_fresh(
             }
             (k.as_get, k.client, (k.head, k.body), k.headers, k.took)
         }
-        None => {
+        None => 'first: {
             // Through a service account (#44): its direct link, without the host's cookies
             // or logins. The host's link stays the download's origin, asked again (through the
             // service) when the direct link dies.
@@ -2439,6 +2460,20 @@ async fn run_fresh(
                 shared,
                 cancel,
             };
+            // #1778: a site rule asks the way a browser connects from the first request.
+            if unlocked.is_none()
+                && let Some((b, answer, switch)) =
+                    browser_at_once(&opts, &target, &asked, expects, |e| shared.event(e), cancel)
+                        .await?
+            {
+                if let Some(switch) = switch {
+                    switch.keep(&mut opts);
+                }
+                browser = Some(b);
+                let (head, body, headers, ttfb) = answer;
+                let client0 = client(&opts, &target, &as_get, &seen)?;
+                break 'first (as_get, client0, (head, body), headers, ttfb);
+            }
             let (mut client0, mut first, as_mdm) = ask.at(&mut opts, &target, &asked).await?;
             asked_as_mdm = as_mdm;
             // #630: the link refused, where the browser's own download of it ended is asked
@@ -3023,7 +3058,9 @@ async fn run_resume(
     // Only the browser-like connection got past the site's bot check (#668): it goes on with
     // it, at the address it had (MDM's own connection would be refused); its first connection
     // asks for its part before the others follow (`wait_for_ranges`).
-    let browser = match saved.browser_like && crate::browserlike::AVAILABLE {
+    // So does one whose site rule asks for it (#1778).
+    let browser_like = saved.browser_like || opts.browser_first && opts.post.is_none();
+    let browser = match browser_like && crate::browserlike::AVAILABLE {
         true => Some(Arc::new(crate::browserlike::Browser::new(
             &opts,
             &saved.final_url,
@@ -3032,7 +3069,11 @@ async fn run_resume(
         false => None,
     };
     if browser.is_some() {
-        shared.event("Going on the way a browser connects, as the site's bot check asked");
+        shared.event(if saved.browser_like {
+            "Going on the way a browser connects, as the site's bot check asked"
+        } else {
+            "Going on the way a browser connects, as its site rule says"
+        });
     }
     // Through a service account (#44), the service is asked for today's link even when the
     // state holds none of its links (the download went directly until now).
@@ -3432,7 +3473,7 @@ async fn segmented(
     let dest = saved.dest.clone();
     let mut synced = Synced {
         at: std::time::Instant::now(),
-        bytes: 0,
+        bytes: saved.downloaded(),
         took: Duration::ZERO,
         covered: 0,
     };
@@ -3528,6 +3569,13 @@ async fn segmented(
 const SYNC_BYTES_MAX: u64 = 64 << 20;
 const SYNC_BYTES_MIN: u64 = 1 << 20;
 const SYNC_EVERY: Duration = Duration::from_secs(30);
+/// What the first progress flush is guessed to write per second before one has been measured: a
+/// hard disk's speed, fast enough that an on-time first tick (up to 2 s of a 1 Gbit/s link into
+/// `HOLD_MAX`) still runs and measures the real disk, and slow enough that — added to whatever
+/// time the start-up state's `fsync` already spent waiting for the disk — a late first flush on a
+/// busy disk (#1633, whether 660 MiB filled the cache or ~200 MiB on a slower link still left
+/// `HOLD_MAX` free) isn't taken to cost less than the ~5 s backlog still ahead of it.
+const FIRST_SYNC_RATE: u64 = 150 << 20;
 
 fn sync_bytes(size: u64) -> u64 {
     (size / 16).clamp(SYNC_BYTES_MIN, SYNC_BYTES_MAX)
@@ -3556,19 +3604,21 @@ impl Synced {
     /// does: it would stop them for as long as it takes.
     fn fits(&self, new: u64, elapsed: Duration, room: u64) -> bool {
         let lasts = room as f64 * elapsed.as_secs_f64() / new.max(1) as f64;
-        self.expected(new).as_secs_f64() <= lasts * 0.75
+        room > 0 && self.expected(new).as_secs_f64() <= lasts * 0.75
     }
 
     /// How long a flush of `new` bytes (written since the last one began) should take: as long
-    /// as that one took for each byte it caught up with. What waits in the cache is what came
-    /// since (above), by bytes, not by time: what the connections kept in memory while the last
-    /// flush held their writes reaches the cache all at once when it ends. Counted by the
-    /// seconds since, a flush right after a long one was expected to take a seventh of what it
-    /// did, and stopped the transfer for the rest (on GitHub's macOS runners: 3 s, 1.4 s of it
-    /// with the memory full).
+    /// as that one took for each byte it caught up with, or — before any progress flush has
+    /// measured the disk (`covered == 0` or `took` zero, #1633) — `new` at `FIRST_SYNC_RATE` plus
+    /// whatever time `took` recorded for the start-up state's `fsync` waiting on any work already
+    /// in the disk's queue. What waits in the cache is what came since (above), by bytes, not by
+    /// time: what the connections kept in memory while the last flush held their writes reaches the
+    /// cache all at once when it ends. Counted by the seconds since, a flush right after a long one
+    /// was expected to take a seventh of what it did, and stopped the transfer for the rest (on
+    /// GitHub's macOS runners: 3 s, 1.4 s of it with the memory full).
     fn expected(&self, new: u64) -> Duration {
-        if self.covered == 0 {
-            return self.took;
+        if self.took.is_zero() || self.covered == 0 {
+            return self.took + Duration::from_secs_f64(new as f64 / FIRST_SYNC_RATE as f64);
         }
         self.took.mul_f64(new as f64 / self.covered as f64)
     }
@@ -3596,6 +3646,7 @@ async fn save_state(
     let due = force || synced.due(bytes, ctx.size, synced.at.elapsed(), room);
     let file = ctx.file.clone();
     let path = path.to_owned();
+    let slow = ctx.opts.slow_disk.clone();
     if !due {
         // Between flushes only a new validator or address is written (with segments on disk).
         if meta_changed {
@@ -3603,9 +3654,12 @@ async fn save_state(
             saved.final_url = final_url;
             saved.final_get = final_get;
             let s = saved.clone();
-            tokio::task::spawn_blocking(move || s.write(&path))
-                .await
-                .expect("state writer panicked")?;
+            tokio::task::spawn_blocking(move || match slow {
+                Some(disk) => disk.sync(|| s.write(&path)),
+                None => s.write(&path),
+            })
+            .await
+            .expect("state writer panicked")?;
         }
         return Ok(());
     }
@@ -3627,14 +3681,20 @@ async fn save_state(
     // new download, a resume's new address (a signed link asked again) or validators. A flush
     // waits for all the disk still has to write, and a resume waited for it (#1328).
     if bytes <= saved.downloaded() {
+        let began = std::time::Instant::now();
         s.segments = segments;
-        *saved = tokio::task::spawn_blocking(move || s.write(&path).map(|()| s))
-            .await
-            .expect("state writer panicked")?;
+        *saved = tokio::task::spawn_blocking(move || match slow {
+            Some(disk) => disk.sync(|| s.write(&path).map(|()| s)),
+            None => s.write(&path).map(|()| s),
+        })
+        .await
+        .expect("state writer panicked")?;
+        if synced.covered == 0 {
+            synced.took = synced.took.max(began.elapsed());
+        }
         return Ok(());
     }
     // Tests' slow disk (its extra flush time not for the forced saves at the start and the end).
-    let slow = ctx.opts.slow_disk.clone();
     let began = std::time::Instant::now();
     let done = tokio::task::spawn_blocking(move || match slow {
         Some(disk) => disk.flush(!force, || s.save(&path, segments, &file).map(|()| s)),
@@ -4086,6 +4146,49 @@ async fn browser_first(
         "{host}: the browser-like connection got through; downloading on it"
     ));
     Ok((b, head, body, headers, took, switch))
+}
+
+/// A first request and its answer through the browser-like connection.
+type BrowserAnswer = (
+    Arc<crate::browserlike::Browser>,
+    (Head, Body, HeaderMap, Duration),
+    Option<FamilySwitch>,
+);
+
+/// #1778: the first request the way a browser connects at once, when a site rule asks for it
+/// (`Options::browser_first`), with its answer (the file's: `check_first`). None when it isn't
+/// asked for, can't be (a build without it, a form's POST) or didn't get the file: the request
+/// then goes on MDM's own connection as any other, the reason told to `event`.
+async fn browser_at_once(
+    opts: &Options,
+    url: &Url,
+    headers: &HeaderMap,
+    expects: bool,
+    event: impl Fn(String),
+    cancel: &CancellationToken,
+) -> Result<Option<BrowserAnswer>, Error> {
+    if !opts.browser_first || !crate::browserlike::AVAILABLE || opts.post.is_some() {
+        return Ok(None);
+    }
+    let host = url.host_str().unwrap_or("?");
+    match browser_ask(opts, url, headers, expects, cancel).await {
+        Ok(got) => {
+            event(format!(
+                "{host}: asked the way a browser connects from the start, as its site rule says"
+            ));
+            if let Some(switch) = &got.2 {
+                event(switch.said());
+            }
+            Ok(Some(got))
+        }
+        Err(e @ (Error::Cancelled | Error::Adapter(_))) => Err(e),
+        Err(e) => {
+            event(format!(
+                "{host}, asked the way a browser connects as its site rule says: {e}; asking on                  Mister Download Manager's own connection"
+            ));
+            Ok(None)
+        }
+    }
 }
 
 /// The browser-like connection for `url`, and its answer to the first request (`browser_first`,
@@ -6837,6 +6940,138 @@ mod tests {
         assert!(at(forced_gap(true, slow)).due(15 << 20, 24 << 20, tick, HOLD_MAX));
         // A save during the transfer does count: 0.5 s for 1 ms of data is a disk far behind.
         assert!(!at(forced_gap(false, slow)).due(15 << 20, 24 << 20, tick, HOLD_MAX));
+    }
+
+    /// #1633: before any progress flush has run, `Synced` guesses a hard disk's speed rather than
+    /// no time at all. An on-time first tick (up to 2 s of a 1 Gbit/s link) still flushes and
+    /// measures the real disk; a late one (the saver held up for seconds on a busy disk while
+    /// hundreds of megabytes piled up) does not flush the whole cache at once, nor does any tick
+    /// once the connections' memory is full.
+    #[test]
+    fn a_late_first_flush_does_not_hold_the_whole_cache() {
+        let (gb, mb) = (1u64 << 30, 1u64 << 20);
+        let s = Duration::from_secs;
+        let fresh = Synced {
+            at: std::time::Instant::now(),
+            bytes: 0,
+            took: Duration::ZERO,
+            covered: 0,
+        };
+        // On time: 64 MiB in 0.4 s at 160 MiB/s, or 2 s of a 1 Gbit/s link (230 MiB).
+        assert!(fresh.due(64 * mb, gb, Duration::from_millis(400), HOLD_MAX));
+        assert!(fresh.due(230 * mb, 45 * gb, s(2), HOLD_MAX));
+        // #1633: 8.6 s in (the start-up state's fsync waited on a busy disk), 660 MiB waiting.
+        assert!(!fresh.due(660 * mb, 45 * gb, Duration::from_millis(8600), HOLD_MAX));
+        // Also when the forced save at the start flushed a first batch (`forced_gap` leaves `took`
+        // at zero while `covered` is non-zero).
+        let after_forced = Synced {
+            covered: 256 << 10,
+            ..fresh
+        };
+        assert!(!after_forced.due(660 * mb, 45 * gb, Duration::from_millis(8600), HOLD_MAX));
+        // Once the download slows down enough for those 660 MiB to fit in memory, it flushes.
+        assert!(fresh.due(660 * mb, 45 * gb, s(66), HOLD_MAX));
+        // With the connections' memory full (a disk that already sets the pace), not even the
+        // first flush starts.
+        assert!(!fresh.due(64 * mb, 45 * gb, s(2), 0));
+        // When writing the initial state took 5 s on a busy disk, a first flush on a ~40 MiB/s
+        // link still has HOLD_MAX free (185–228 MiB in 5.1 s), so counting only new bytes at
+        // 150 MiB/s makes it look cheap (~1.2–1.5 s) even though the disk's ~5 s backlog runs
+        // before it. With the initial sync duration included, both skip, and flush once slower.
+        let busy_start = Synced {
+            took: s(5),
+            ..fresh
+        };
+        assert!(!busy_start.due(185 * mb, gb, Duration::from_millis(5100), HOLD_MAX));
+        assert!(!busy_start.due(228 * mb, gb, Duration::from_millis(5100), HOLD_MAX));
+        assert!(busy_start.due(185 * mb, gb, s(15), HOLD_MAX));
+        // A brief start-up state save (#518: 500 ms) adds only those 500 ms flat, not scaled
+        // by a tiny forced-save byte count, so a normal first tick still flushes.
+        let brief_start = Synced {
+            took: Duration::from_millis(500),
+            ..fresh
+        };
+        assert!(brief_start.due(15 * mb, 24 * mb, s(2), HOLD_MAX));
+    }
+
+    /// #1633, the busy start on a link no faster than the disk, timed on the test disk's own
+    /// clock: 240 MiB already queued on a 48 MiB/s disk, then the saver as `segmented` runs it
+    /// (the start-up state's sync, then a check every 100 ms) while the connections write at
+    /// `pace`. Whatever the pace and however long the download took to start, a flush during the
+    /// transfer starts only when the connections' memory covers it with room to spare: what the
+    /// rule lets through holds the writes for at most three quarters of what `HOLD_MAX` lasts.
+    ///
+    /// The end-to-end test (`a_busy_disk_at_the_start_does_not_stop_the_transfer`) once counted
+    /// the flushes for this, which held only at the pace and start it was written for: on
+    /// GitHub's macOS runner the link gave 30 MiB/s, the memory lasted 8.5 s, and a flush of
+    /// 2.4 s rightly ran in the middle (nothing stood still for more than 29 ms).
+    #[test]
+    fn a_busy_start_flushes_only_what_the_memory_covers() {
+        use crate::slowdisk::{Clock, SlowDisk};
+        let mib = 1u64 << 20;
+        let ms = Duration::from_millis;
+        let (size, tick) = (512 * mib, ms(100));
+        // How long the memory lasts at `pace`, and the bytes that come in `d` at it.
+        let lasts = |pace: u64| Duration::from_secs_f64(HOLD_MAX as f64 / pace as f64);
+        let bytes_in = |pace: u64, d: Duration| (pace as f64 * d.as_secs_f64()) as u64;
+        // The first flush during the transfer, if any: when (from the request), and how long it
+        // held the writes.
+        let first_flush = |pace: u64, start: Duration| -> Option<(Duration, Duration)> {
+            let now = std::time::Instant::now();
+            let clock = Clock::Manual(std::sync::Arc::new(std::sync::Mutex::new(now)));
+            let disk = SlowDisk::with_clock(48 * mib, 256 * mib, Duration::ZERO, clock.clone());
+            disk.write(240 * mib, || ());
+            // The request and the part file, before `segmented` starts; the disk writes on.
+            clock.sleep(start);
+            let began = clock.now();
+            disk.sync(|| ());
+            let took = clock.now() - began;
+            // The connections received meanwhile, queued behind what came before them.
+            let mut bytes = bytes_in(pace, took).min(size);
+            disk.write(bytes, || ());
+            let synced = Synced {
+                at: now,
+                bytes: 0,
+                took,
+                covered: 0,
+            };
+            let mut elapsed = took;
+            while bytes < size {
+                clock.sleep(tick);
+                elapsed += tick;
+                let got = bytes_in(pace, tick).min(size - bytes);
+                disk.write(got, || ());
+                bytes += got;
+                // A link no faster than the disk never fills the cache: no write waits, and the
+                // connections hold nothing in memory (`room` is all of it).
+                assert_eq!(disk.stats().writes_waited, 0);
+                if synced.due(bytes, size, elapsed, HOLD_MAX) {
+                    disk.flush(true, || ());
+                    return Some((start + elapsed, disk.stats().holds[0]));
+                }
+            }
+            None
+        };
+        for pace in [8, 16, 24, 30, 36, 40, 44, 46, 48].map(|p| p * mib) {
+            for start in [0, 250, 500, 1000, 1500, 2000, 3000, 5000].map(ms) {
+                if let Some((at, held)) = first_flush(pace, start) {
+                    assert!(
+                        held <= lasts(pace).mul_f64(0.75),
+                        "{} MiB/s, started after {start:?}: a flush at {at:?} held the writes \
+                         {held:?}, the memory lasts {:?}",
+                        pace / mib,
+                        lasts(pace)
+                    );
+                }
+            }
+        }
+        // At the end-to-end test's pace (8 connections of 6 MiB/s, as fast as the disk) and a
+        // prompt start, no flush during the transfer: the 5 s backlog ahead of it never fits.
+        assert_eq!(first_flush(48 * mib, Duration::ZERO), None);
+        assert_eq!(first_flush(46 * mib, ms(250)), None);
+        // At the 30 MiB/s macOS's runner gave, one does, and it fits.
+        let (_, held) = first_flush(30 * mib, ms(250)).expect("a flush during the transfer");
+        assert!(held < lasts(30 * mib) / 2, "{held:?}");
     }
 
     /// #782: what the slow check makes of connections that wait for the disk. A connection

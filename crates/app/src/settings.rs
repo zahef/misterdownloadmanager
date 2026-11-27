@@ -372,6 +372,9 @@ pub struct Settings {
     /// before Automatic). Neither (the default, and what settings saved before it say):
     /// Automatic, the round form in a feed and over a small player, the words over a big one.
     pub video_panel_full: bool,
+    /// General → Download panels → Button size (#1923), percent: one of
+    /// `mdm_ipc::capture::VIDEO_PANEL_SCALES` (80, 100 or 120). The host reads it too.
+    pub video_panel_scale: u16,
     /// General: also take the listed types the browser would open itself (a PDF in its viewer,
     /// an MP3 in its player); holding Alt while clicking leaves one to the browser.
     pub capture_opened: bool,
@@ -382,6 +385,10 @@ pub struct Settings {
     /// Save to: a folder per category (category label → folder); missing = the default.
     pub category_dirs: Vec<(String, String)>,
     pub change_folder_on_last: bool,
+    /// Save to → "Save every download in General's folder" (#1973): new downloads of every
+    /// category go to General's folder ([`Settings::save_dir`]); the categories still sort the
+    /// list. Off by default, and in settings saved before it.
+    pub one_folder: bool,
     /// The addresses typed into Add URL and the folders downloads were saved to, newest first
     /// (the Address and Save As drop lists, as IDM's UrlHistory.txt).
     pub url_history: Vec<String>,
@@ -409,8 +416,14 @@ pub struct Settings {
     /// MDM reads as its default again.
     #[serde(deserialize_with = "automatic_agent")]
     pub user_agent: String,
-    /// Connection: per-server connection limits (server, number).
+    /// Connection: per-server connection limits (server, number), in their order: the first
+    /// that names a download's server gives its number (`mdm_ipc::siterules::for_url`). A site
+    /// rule's number of connections is the exception under its pattern.
     pub conn_exceptions: Vec<(String, u32)>,
+    /// Connection → Site rules (#1778): a User-Agent, the browser-like connection and request
+    /// headers by site pattern, the first rule that matches and sets each giving it. Their
+    /// numbers of connections are in `conn_exceptions`, which older versions read.
+    pub site_rules: Vec<mdm_ipc::siterules::SiteRule>,
     /// Proxy / Socks: 0 none, 1 system, 2 automatic script, 3 manual.
     pub proxy_from_browser: bool,
     pub proxy_mode: u8,
@@ -695,11 +708,13 @@ impl Default for Settings {
             video_panel_sites: String::new(),
             video_panel_compact: false,
             video_panel_full: false,
+            video_panel_scale: 100,
             capture_opened: true,
             capture_min_kb: 0,
             regional: crate::regional::Regional::default(),
             category_dirs: Vec::new(),
             change_folder_on_last: true,
+            one_folder: false,
             url_history: Vec::new(),
             folder_history: Vec::new(),
             set_creation_date: false,
@@ -714,6 +729,7 @@ impl Default for Settings {
             duplicate_action: 0,
             user_agent: String::new(),
             conn_exceptions: Vec::new(),
+            site_rules: Vec::new(),
             proxy_from_browser: true,
             proxy_mode: 0,
             proxy_script: String::new(),
@@ -997,6 +1013,33 @@ impl Settings {
         crate::model::category_folder(cat, downloads, &self.category_dirs)
     }
 
+    /// The folder a new download of this category goes to: its category's, or General's for
+    /// every category with one folder for every download (#1973).
+    pub fn save_dir(
+        &self,
+        cat: crate::model::Category,
+        downloads: &std::path::Path,
+    ) -> std::path::PathBuf {
+        self.category_dir(self.folder_category(cat), downloads)
+    }
+
+    /// The category whose folder a new download of `cat` takes and "Remember this path"
+    /// changes: `cat` itself, or General with one folder for every download (#1973).
+    pub fn folder_category(&self, cat: crate::model::Category) -> crate::model::Category {
+        crate::model::folder_category(cat, self.one_folder)
+    }
+
+    /// The folder a download of `cat` was saved to becomes the folder its kind of download
+    /// takes from now on ([`Self::keep_category_dir`] for [`Self::folder_category`]).
+    pub fn keep_save_dir(
+        &mut self,
+        cat: crate::model::Category,
+        dir: &std::path::Path,
+        downloads: &std::path::Path,
+    ) -> bool {
+        self.keep_category_dir(self.folder_category(cat), dir, downloads)
+    }
+
     /// Manual proxy/socks configuration as it is set (#1558): its type, whether names are looked
     /// up through it, and its address without a scheme (`host` or `host:port`). An address
     /// typed with a proxy's scheme (`socks5://host`, as the docs said before Type) says the type
@@ -1181,15 +1224,20 @@ impl Settings {
         }
     }
 
-    /// Connections for a download from `url`: a server exception (Options → Connection), else
-    /// the default; never more than `connection_limit` (a hand-edited file can hold anything).
+    /// Connections for a download from `url`: the first server exception that names it
+    /// (Options → Connection, a site rule's number among them: `*` for any text, the first
+    /// match winning), else the default; never more than `connection_limit` (a
+    /// hand-edited file can hold anything).
     pub fn connections_for(&self, url: &url::Url) -> u32 {
-        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-        self.conn_exceptions
-            .iter()
-            .find(|(server, _)| host_matches(&host, server))
-            .map_or(self.max_connections, |(_, n)| *n)
+        self.site_settings(url)
+            .connections
+            .unwrap_or(self.max_connections)
             .clamp(1, self.connection_limit())
+    }
+
+    /// What the site rules and the exceptions give a download from `url` (#1778).
+    pub fn site_settings(&self, url: &url::Url) -> mdm_ipc::siterules::Applied {
+        mdm_ipc::siterules::for_url(&self.site_rules, &self.conn_exceptions, url)
     }
 
     /// The Sites Logins entry for `url`: its site/path is a prefix of the address (without the
@@ -1502,6 +1550,11 @@ impl Settings {
                     url: self.public_trackers_list().to_owned(),
                     dir,
                 }),
+            // Site rules and exceptions (#1778): the command line asks a site as the app does.
+            sites: mdm_cli::SiteRules {
+                rules: self.site_rules.clone(),
+                exceptions: self.conn_exceptions.clone(),
+            },
         }
     }
 }
@@ -1652,6 +1705,66 @@ mod tests {
         assert!(!s.keep_category_dir(Category::Video, chosen, downloads));
     }
 
+    /// #1973: one folder for every download sends every category's new downloads to General's
+    /// folder (the user's own and Torrents too), and a folder remembered then is General's; off,
+    /// each category's folder is as before. Settings saved before it (no `one_folder`) read it
+    /// off, and a newer file's field is kept through a save.
+    #[test]
+    fn one_folder_sends_every_category_to_generals() {
+        use crate::model::Category;
+        let root = std::env::temp_dir().join("mdm-1973");
+        let downloads = root.join("Downloads");
+        let downloads = downloads.as_path();
+        let old: super::Settings = serde_json::from_value(serde_json::json!({
+            "category_dirs": [["General", root.join("All").display().to_string()]],
+        }))
+        .unwrap();
+        assert!(!old.one_folder, "off in settings saved before it");
+        let mut s = old.clone();
+        let general = root.join("All");
+        let cats = [
+            Category::Video,
+            Category::Music,
+            Category::Compressed,
+            Category::Torrents,
+            Category::General,
+        ];
+        for c in cats {
+            assert_eq!(
+                s.save_dir(c, downloads),
+                s.category_dir(c, downloads),
+                "{c:?}"
+            );
+        }
+        assert_ne!(s.save_dir(Category::Video, downloads), general);
+        s.one_folder = true;
+        for c in cats {
+            assert_eq!(s.save_dir(c, downloads), general, "{c:?}");
+            assert_eq!(s.folder_category(c), Category::General);
+        }
+        // Each category keeps its own folder for when it is off again.
+        assert_eq!(
+            s.category_dir(Category::Video, downloads),
+            general.join("Video")
+        );
+        // "Remember this path": General's folder is the one that changes.
+        let chosen = root.join("Elsewhere");
+        assert!(s.keep_save_dir(Category::Video, &chosen, downloads));
+        assert_eq!(s.save_dir(Category::Music, downloads), chosen);
+        assert_eq!(s.category_dir(Category::General, downloads), chosen);
+        assert!(
+            !s.category_dirs.iter().any(|(c, _)| c == "Video"),
+            "Video's own folder untouched: {:?}",
+            s.category_dirs
+        );
+        // Saved and read again (a newer version's file read by this one keeps the choice).
+        let again: super::Settings =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert!(again.one_folder);
+        s.one_folder = false;
+        assert_eq!(s.save_dir(Category::Video, downloads), chosen.join("Video"));
+    }
+
     /// #1563: a list from 0.5.2 that remembered "Also delete the files from disk" ticked (and
     /// the question turned off) loads as before otherwise, and its next save drops the tick.
     #[test]
@@ -1751,6 +1864,25 @@ mod tests {
         let rules: mdm_ipc::capture::CaptureRules =
             serde_json::from_value(serde_json::to_value(Settings::default()).unwrap()).unwrap();
         assert!(!rules.video_panel_compact);
+        assert_eq!(auto.video_panel_scale, 100, "100% scale by default");
+        assert_eq!(
+            old.video_panel_scale, 100,
+            "settings saved before #1923: 100%"
+        );
+        assert_eq!(rules.video_panel_scale, 100);
+        for scale in [80, 120] {
+            let scaled = Settings {
+                video_panel_scale: scale,
+                ..Settings::default()
+            };
+            let saved = serde_json::to_value(&scaled).unwrap();
+            let again: Settings = serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(again.video_panel_scale, scale);
+            let rules: mdm_ipc::capture::CaptureRules = serde_json::from_value(saved).unwrap();
+            assert_eq!(rules.video_panel_scale, scale);
+        }
+        assert_eq!(mdm_ipc::capture::clean_video_panel_scale(0), 100);
+        assert_eq!(mdm_ipc::capture::clean_video_panel_scale(999), 100);
     }
 
     #[test]
@@ -2206,6 +2338,34 @@ mod tests {
         assert_eq!(got("http=http://p:3128/"), http("p", "3128", true, false));
         assert_eq!(got("ftp=f:21"), None);
         assert_eq!(got(""), None);
+    }
+
+    /// #1778: site rules round-trip through the settings file, an older file has none, and the
+    /// exceptions match the same way: `*` any text, the first match winning.
+    #[test]
+    fn site_rules_and_exceptions() {
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        let s = Settings {
+            conn_exceptions: vec![("*.example.test".into(), 4), ("dl.example.test".into(), 2)],
+            site_rules: vec![mdm_ipc::siterules::SiteRule {
+                site: "*.example.test".into(),
+                user_agent: "Rule/1".into(),
+                browser_like: true,
+                headers: vec![("X-A".into(), "1".into())],
+            }],
+            ..Settings::default()
+        };
+        assert_eq!(s.connections_for(&url("https://dl.example.test/f")), 4);
+        assert_eq!(s.connections_for(&url("https://example.test/f")), 8);
+        let got = s.site_settings(&url("https://dl.example.test/f"));
+        assert_eq!(got.user_agent.as_deref(), Some("Rule/1"));
+        assert!(got.browser_like);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.site_rules, s.site_rules);
+        let old: Settings =
+            serde_json::from_str(r#"{"conn_exceptions": [["ftp.slow.org", 1]]}"#).unwrap();
+        assert!(old.site_rules.is_empty());
+        assert_eq!(old.connections_for(&url("ftp://ftp.slow.org/a")), 1);
     }
 
     #[test]
