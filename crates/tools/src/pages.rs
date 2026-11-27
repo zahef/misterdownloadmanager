@@ -65,9 +65,21 @@ pub fn is_video_page(url: &Url) -> bool {
 
 /// The address to give yt-dlp for a video page: Dailymotion's embedded player
 /// (`geo.dailymotion.com/player/<player>.html?video=<id>`, what a site embedding it shows) becomes
-/// the video's own page, which is the one that always lists its formats (#359). Any other address
-/// as it is.
+/// the video's own page, which is the one that always lists its formats (#359). A stream list on
+/// octopusmanifest.org (`<id>/playlist.m3u8`, H.264 up to 720p, the one its pages name) becomes
+/// the VP9 list beside it (`<id>/playlist_vp9.m3u8`, up to 1080p), which its player plays. Any
+/// other address as it is.
 pub fn video_address(page: &str) -> String {
+    if let Ok(mut url) = Url::parse(page)
+        && url
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("octopusmanifest.org"))
+        && let Some(id) = url.path().strip_suffix("/playlist.m3u8")
+    {
+        let path = format!("{id}/playlist_vp9.m3u8");
+        url.set_path(&path);
+        return url.into();
+    }
     let id = Url::parse(page).ok().and_then(|url| {
         let player = url
             .host_str()
@@ -232,6 +244,21 @@ mod tests {
             "https://www.dailymotion.com/video/x8abcd",
             "https://www.youtube.com/watch?v=x",
             "not an address",
+        ] {
+            assert_eq!(video_address(same), same);
+        }
+    }
+
+    #[test]
+    fn octopusmanifests_h264_list_becomes_its_1080p_vp9_one() {
+        assert_eq!(
+            video_address("https://octopusmanifest.org/cdbc1433-8a0d/playlist.m3u8?t=1"),
+            "https://octopusmanifest.org/cdbc1433-8a0d/playlist_vp9.m3u8?t=1"
+        );
+        for same in [
+            "https://octopusmanifest.org/cdbc1433-8a0d/playlist_vp9.m3u8",
+            "https://octopusmanifest.org/cdbc1433-8a0d/7sop/v.m3u8",
+            "https://cdn.test/cdbc1433-8a0d/playlist.m3u8",
         ] {
             assert_eq!(video_address(same), same);
         }
