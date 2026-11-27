@@ -4,6 +4,7 @@ on:
     inputs:
       base: {default: 51c631dc2a8299e0a2035b449a50cedac159fcf2}
       resolve: {default: "{}"}
+      out: {default: my-mdm-next}
       branches: {default: "pr/preview-while-downloading pr/main-queue-default auto-remove-deleted toolbar-colors retry-server-down"}
 permissions:
   contents: write
@@ -33,5 +34,7 @@ jobs:
               exit 1
             fi
           done
-          git push -f origin HEAD:refs/heads/my-mdm-next
+          # The English catalog as the code has it (a union merge can leave its notes out of order).
+          python3 tools/i18n/extract.py >/dev/null && if ! git diff --quiet -- i18n/en.tsv; then git commit -q -m "i18n: en.tsv as the code has it" -- i18n/en.tsv; echo "en.tsv regenerated"; fi
+          git push -f origin HEAD:refs/heads/${{ inputs.out }}
           echo MERGED $(git rev-parse HEAD)
