@@ -5,6 +5,7 @@ on:
       base: {default: 51c631dc2a8299e0a2035b449a50cedac159fcf2}
       resolve: {default: "{}"}
       out: {default: my-mdm-next}
+      message: {default: "my-mdm: add"}
       branches: {default: "pr/preview-while-downloading pr/main-queue-default auto-remove-deleted toolbar-colors retry-server-down"}
 permissions:
   contents: write
@@ -27,7 +28,7 @@ jobs:
           git checkout -q ${{ inputs.base }}
           for b in ${{ inputs.branches }}; do
             git fetch -q origin "$b"
-            if git merge --no-edit -m "my-mdm: add $b" FETCH_HEAD; then echo "OK $b";
+            if git merge --no-edit -m "${{ inputs.message }} $b" FETCH_HEAD; then echo "OK $b";
             elif RESOLVE='${{ inputs.resolve }}' python3 "$RUNNER_TEMP/resolve.py" "$b" && git commit --no-edit; then echo "OK (resolved) $b"; else
               echo "CONFLICTS in $b:"; git diff --name-only --diff-filter=U
               for f in $(git diff --name-only --diff-filter=U); do echo "===== $f"; git diff -- "$f" | head -c 30000; done
